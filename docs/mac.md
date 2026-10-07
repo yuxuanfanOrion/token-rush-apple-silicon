@@ -54,13 +54,15 @@ greedy at every acceptance length, and a snapshot resume against a cold prefill
 
 ## Raw decode
 
-`bench/mac/decode.py`, 256 greedy tokens, same bytes for both:
+`bench/mac/decode.py`, 256 greedy tokens, same bytes for both, one run in one
+process (`results/mac/decode.txt`, after the fusion below; a cooler machine earlier
+in the day gave 18.5 pipelined, see "Heat"):
 
 | | tok/s | % of the wall |
 |---|---|---|
-| ours, one eval per step | 17.5 | 82.1% |
-| **ours, pipelined** (step t+1 built while t runs; the token never visits the host) | **18.5** | **86.7%** |
-| mlx-lm 0.32 | 17.8 | 83.4% |
+| ours, one eval per step | 17.3 | 80.9% |
+| **ours, pipelined** (step t+1 built while t runs; the token never visits the host) | **18.4** | **86.2%** |
+| mlx-lm 0.32 | 17.2 | 80.6% |
 
 Removing int4 matmuls from the step leaves 7.7 ms of the 57 (everything else:
 GDN, attention, norms, ~25 small kernels per layer). Compiling the position-free
@@ -159,7 +161,7 @@ request for code ran at **61 tok/s** on DFlash2 (6.5 tokens per step), an
 Anthropic request in Chinese on the MTP chain at 25 tok/s greedy (2.1 per step),
 and a second turn reused the first turn's prompt.
 
-## Against vLLM and SGLang on the same Mac
+## Against vLLM, SGLang and llama.cpp on the same Mac
 
 Same machine, same day, same int4 bytes for every engine: the checkpoint written
 as a standard mlx-lm directory by `bench/mac/export_mlx_lm.py` (renamed, not
@@ -171,16 +173,19 @@ two. Logs and JSON in `results/mac/rivals/`.
 |---|---|---|---|---|
 | **token-rush, `--draft auto`** (DFlash2 for these prompts) | **32.0** | **49.2** | **51.1** | DFlash2, K = 7 |
 | token-rush, `--draft mtp` | 34.2 | 38.4 | 38.2 | MTP chain, K = 3 |
-| token-rush, `--draft raw` | 16.8 | 16.9 | 16.9 | none |
+| token-rush, `--draft raw` | 15.2 | 15.7 | 15.9 | none |
 | vllm-metal 0.31.0 (vLLM on MLX) | 16.9 | 17.0 | 16.9 | none available for this model |
 | SGLang, MLX backend | did not run | | | |
-| mlx-lm 0.32 (in process, `bench/mac/decode.py`) | 17.8 | | | none |
+| llama.cpp (b11429, b11474), unsloth UD-Q4_K_M GGUF | wrong output | | | |
+| mlx-lm 0.32 (in process, `bench/mac/decode.py`) | 17.2 | | | none |
 
 Raw decode is a tie: every MLX engine streams the same bytes at about the same
 fraction of the wall. Run interleaved on a warm machine (vllm-metal, ours,
 vllm-metal again; `*-ab*.json`), ours lands between the two vllm-metal runs on every
 prompt (16.3 / 14.7 / 14.2 against 16.8-15.1 / 15.8-14.4 / 15.4-13.9). The server's
-raw path syncs every step; the in-process pipelined loop gets 18.2-18.5. The margin is speculation, and on this model neither
+raw path syncs every step; the in-process pipelined loop gets 18.4. The
+`--draft raw` row was run 35 minutes after vllm-metal's, on a warmer machine; the
+interleaved runs are the comparison. The margin is speculation, and on this model neither
 rival can use any:
 
 - **vllm-metal** (installed with its `install.sh`, `vllm serve <dir>
@@ -201,6 +206,16 @@ rival can use any:
   never builds (`'NoneType' object has no attribute 'conv'`, after
   `--mamba-scheduler-strategy no_buffer --disable-overlap-schedule`, without which
   it refuses with "extra_buffer needs CUDA/MUSA/NPU (FLA)").
+- **llama.cpp** (Homebrew build 11429 and the b11474 release, `-ngl 999 -c 8192
+  --jinja`, unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf`). It loads and runs, and it is
+  the one rival with both drafts for this model (`--spec-type draft-mtp`,
+  `draft-dflash` with z-lab's DFlash2 GGUF), but the text is wrong: "The capital of
+  France is" continues " city of the the activity of the city of Paris. they
+  remains the both are", the same on Metal and on the CPU, with tokenization
+  identical to ours. Its speeds (16 raw, 10-11 with MTP, 8-10 with DFlash2, the drafts
+  accepting 1.2-1.5 tokens a step against a broken target) are kept in
+  `results/mac/rivals/llama.cpp-*.garbled.json` and not in the table. Another GGUF
+  quantization was not tried.
 
 ## Long context
 
@@ -262,6 +277,13 @@ as `step_profile.py` does, never across runs.
 - **The quality row on Mac.** KL against bf16 needs the bf16 checkpoint (55.6 GB);
   the engine-vs-mlx-lm KL above is the correctness evidence, and the quantization
   numbers carry over because the bytes are the same.
+- **SGLang cannot serve Qwen3.8 on a Mac.** Open, to fix later. Its MLX backend
+  fails at startup on any model from v0.5.16 on (`kv_cache_configurator`), and
+  v0.5.15 has no Apple path for the GDN layers: the linear-attention backend
+  expects the CUDA/FLA state pool (`'NoneType' object has no attribute 'conv'`,
+  `gdn_backend.py:277`). Making it run means giving SGLang an MLX GDN layer with
+  a recurrent-state pool, or fixing the stub in the newer versions; details in
+  `results/mac/rivals/errors.md`.
 - **Other Apple GPUs.** Everything was measured on one M5 Pro. M1-M4 run the same
   code with the `matmul2d` kernel switched off; their walls and verify costs are
   unmeasured.

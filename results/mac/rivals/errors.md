@@ -18,3 +18,16 @@ v0.5.15, Qwen3.8-27B export, default: AssertionError: extra_buffer needs CUDA/MU
 v0.5.15, --mamba-scheduler-strategy no_buffer --disable-overlap-schedule:
 AttributeError: 'NoneType' object has no attribute 'conv'
   at sglang/srt/layers/attention/linear/gdn_backend.py:277 (__init__)
+
+## llama.cpp (brew build 11429 and release b11474), unsloth/Qwen3.8-27B-GGUF UD-Q4_K_M
+Runs, but the output is wrong, so its speeds are not comparable and are left out of
+docs/mac.md. Same text on Metal (`-ngl 999`, with and without `-fa off`) and on the CPU
+(`-ngl 0`); tokenization matches ours ([760, 6511, 314, 9338, 369] for the prompt below).
+/completion "The capital of France is", greedy:
+  ' city of the the activity of the city of Paris. they remains the both are'
+chat, "Write a Python function that checks whether a number is prime.", thinking off:
+  '的模型语言（在其.名称是反的.'
+Speeds of the garbled runs (llama.cpp-*.garbled.json, best of two, essay/code/math):
+raw 16.0/16.2/15.9, draft-mtp 11.2/10.1/10.0 (mean accepted length 1.38-1.49),
+draft-dflash with the Q4_K_M DFlash2 GGUF 9.7/7.8/9.4 (1.24-1.49): the drafts cannot
+predict a broken target. Not tried: another quantization of the GGUF (no disk room).
