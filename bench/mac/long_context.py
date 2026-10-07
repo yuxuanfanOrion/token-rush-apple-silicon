@@ -27,7 +27,7 @@ SUMMARY = "\n\nSummarize the text above in detail, section by section."
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ctx", default="8192,32768,60000")
+    ap.add_argument("--ctx", default="8192,32768")
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--depth", type=float, default=0.5)
     a = ap.parse_args()

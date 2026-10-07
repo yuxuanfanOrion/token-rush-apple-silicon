@@ -539,7 +539,7 @@ def main():
     ap.add_argument("--backend", default=None, choices=("marlin", "triton", "tinygemm", "dequant"))
     ap.add_argument("--kv", default="fp8", choices=("bf16", "fp8"))
     ap.add_argument("--max-len", type=int, default=None,
-                    help="the context window; default 256k on CUDA (~30 GB with both drafts), 64k on a Mac")
+                    help="the context window; default 256k on CUDA (~30 GB with both drafts), 32k on a Mac")
     ap.add_argument("--chunk", type=int, default=4096)
     ap.add_argument("--think", default="auto", choices=("auto", "on", "off"),
                     help="thinking: auto follows the request (Anthropic `thinking`, OpenAI `reasoning_effort` / chat_template_kwargs)")
@@ -554,9 +554,9 @@ def main():
     args = ap.parse_args()
     if sys.platform == "darwin":                      # Apple Silicon: the MLX backend, tokenrush/mlx
         from .mlx.serve import load_session as load_mlx
-        # bf16 KV, 64 KB per token: 4.3 GB at 64k (plus ~1.6 GB for the drafts' caches);
+        # bf16 KV, 64 KB per token: 2.1 GB at 32k (plus ~0.8 GB for the drafts' caches);
         # --kv and --backend are CUDA options and do not apply
-        args.max_len = args.max_len or 65536
+        args.max_len = args.max_len or 32768
         session, tok, cfg = load_mlx(args)
     else:
         args.max_len = args.max_len or 262144

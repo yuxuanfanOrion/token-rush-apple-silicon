@@ -9,7 +9,7 @@ of the same configuration drift by 10-15% (see "Heat" below).
 
 ```
 uv sync --extra mac-bench                     # mlx, CPU torch (the shared serving code imports it), mlx-lm for the benches
-uv run python -m tokenrush.serve              # picks the MLX backend on macOS; 64k context by default
+uv run python -m tokenrush.serve              # picks the MLX backend on macOS; 32k context by default
 uv run --extra bench pytest tests/mac -q      # kernels, engine and session on a small random model
 ```
 
@@ -256,9 +256,9 @@ as `step_profile.py` does, never across runs.
 - **The verify kernel at M = 4..8.** `qmm_nax` costs 1.2-1.5x at M = 1 and the
   variants above did not move it; the bound is not the dequantization. Profiling
   the kernel itself (Xcode's Metal counters) is the next step there.
-- **Long context beyond 60k.** Measured to 60k (the needle is found there); 128k and
-  256k need `--max-len` and 8-17 GB of bf16 KV, with no fp8 cache yet. Prefill at
-  long context is attention-bound in MLX's kernel and slow (4 minutes for 60k).
+- **Context is 32k on a Mac by design.** That is the target here (`--max-len`
+  default 32768, 2.1 GB of KV); 60k was measured once and works, longer is not a
+  goal. Prefill of a full 32k prompt takes about 1.5 minutes, compute-bound.
 - **The quality row on Mac.** KL against bf16 needs the bf16 checkpoint (55.6 GB);
   the engine-vs-mlx-lm KL above is the correctness evidence, and the quantization
   numbers carry over because the bytes are the same.
