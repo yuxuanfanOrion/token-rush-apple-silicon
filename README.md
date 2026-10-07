@@ -55,6 +55,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8000 ANTHROPIC_AUTH_TOKEN=anything claude
 
 `--draft mtp` switches to the shipped MTP head as the draft (the default picks it for Chinese prompts), `--no-spec` / `--draft raw` turns speculation off, `--max-len` sets the context window (256k needs ~30 GB with both drafts). More in [docs/serving.md](docs/serving.md).
 
+On Apple Silicon the same server runs on MLX (`tokenrush/mlx/`), picked automatically on macOS: same checkpoint with no conversion, same drafts, same APIs. On an M5 Pro it decodes at 18.5 tok/s raw (86.7% of the measured 291 GB/s wall) and 28-50 tok/s with the drafts. Setup, measurements and what is missing in [docs/mac.md](docs/mac.md).
+
 ## How
 
 <picture>
@@ -127,11 +129,11 @@ Every number here comes from one machine in one sitting, 2026-09-12, every rival
 
 | | |
 |---|---|
-| `tokenrush/` | the engine: `model.py` (the text path), `fused.py` / `ops.py` (Triton kernels), `csrc/` (the Marlin port), `spec.py` / `mtp.py` / `dflash.py` (speculation), `gptq.py` / `quant.py` (quantization), `run.py`, `serve.py` |
+| `tokenrush/` | the engine: `model.py` (the text path), `fused.py` / `ops.py` (Triton kernels), `csrc/` (the Marlin port), `spec.py` / `mtp.py` / `dflash.py` (speculation), `gptq.py` / `quant.py` (quantization), `run.py`, `serve.py`; `mlx/` is the Apple Silicon backend |
 | `bench/` | the measurements: decode, context sweeps, quality, needle, GSM8K |
 | `scripts/` | rival benches, the quantization recipe, table and figure generators |
 | `tests/` | the differential and protocol tests |
-| `docs/` | baselines, environment, progress, quantization, serving, traps |
+| `docs/` | baselines, environment, progress, quantization, serving, traps, mac |
 | `results/` | raw logs of every reported run |
 
 ## Author
