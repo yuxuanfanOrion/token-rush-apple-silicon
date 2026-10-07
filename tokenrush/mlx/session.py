@@ -125,6 +125,11 @@ class Session:
         for s in self.snaps:
             if s.mode == mode and MIN_REUSE <= s.pos <= L and (best is None or s.pos > best.pos):
                 best = s
+        # Snapshots at or before the resume point stay valid: this request writes engine and
+        # draft rows from `start` on only. Kept, a long shared prefix (one document, several
+        # questions) is reused by every later request, not just the next one.
+        start_at = best.pos if best is not None else 0
+        keep = [s for s in self.snaps if s.pos <= start_at and s is not best]
         self.ids, self.snaps = [], []                # rewritten below only once the prefill succeeds
         if best is not None:
             self._restore(best)
@@ -139,7 +144,9 @@ class Session:
         stats.reused_tokens, stats.prefill_tokens = start, T - start
         last = self._prefill(ids, start, mode, prev) if start < T else prev
         self.ids = list(ids)
-        self.snaps = [self._take(mode, last)]
+        self.snaps = keep + ([best] if best is not None else [])
+        if not self.snaps or self.snaps[-1].pos != T:
+            self.snaps.append(self._take(mode, last))
         tok = (pick or (lambda l: mx.argmax(l, -1)))(eng.w.lm_head(last)).astype(mx.int32)
         mx.eval(tok)
         stats.prefill_s = time.perf_counter() - t0

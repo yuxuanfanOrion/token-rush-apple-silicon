@@ -264,3 +264,49 @@ def test_generate_stops_at_the_context_limit():
     e = tiny_engine(max_len=64)
     out, st = generate(e, None, list(range(5, 45)), max_new=100, K=0)
     assert e.state.pos == e.max_len and len(out) == e.max_len - 40
+
+
+def test_session_keeps_snapshots_of_a_shared_prefix():
+    """One document, two questions: the second reuses the document even though the
+    first question's own snapshots are not prefixes of it."""
+    from tokenrush.mlx.session import Session
+    e = tiny_engine(max_len=512)
+    s = Session(e, _Tok(), e.cfg, chunk=16)
+    doc = list(range(5, 85))
+    list(s.generate(doc, max_new=0, mode="raw"))
+    list(s.generate(doc + [300, 301, 302], max_new=4, mode="raw"))
+    assert s.stats.reused_tokens == len(doc)
+    list(s.generate(doc + [400, 401], max_new=6, mode="raw"))
+    assert s.stats.reused_tokens == len(doc)
+
+
+def _fused_inputs():
+    """Inputs at the real model's scales for every compiled group, by name."""
+    mx.random.seed(11)
+    bf = lambda *sh, sc=1.0: (mx.random.normal(sh) * sc).astype(mx.bfloat16)
+    return {
+        "gdn_prep": (bf(4, 16, 128), bf(4, 16, 128), bf(4, 48), bf(4, 48),
+                     -mx.random.uniform(0.5, 2, (48,)), mx.random.normal((48,)), 128 ** -0.5),
+        "gated_norm": (bf(4 * 48, 128), 1 + bf(128, sc=0.1), bf(4 * 48, 128), 1e-6),
+        "swiglu": (bf(4, 2 * 1024, sc=4),),
+        "sigmoid_gate": (bf(4, 6144), bf(4, 6144)),
+        "conv_silu": (bf(7, 1024, sc=3), bf(1024, 4, sc=0.3)),
+        "add_norm": (bf(4, 5120, sc=20), bf(4, 5120, sc=5), 1 + mx.random.normal((5120,)) * 0.1, 1e-6),
+    }
+
+
+def test_fused_groups_are_bit_identical():
+    """model.FUSE compiles elementwise groups; none may change a bit (gdn_prep did, which
+    moved the real model's KL to mlx-lm, and is not compiled). Every compiled group
+    needs inputs here."""
+    import tokenrush.mlx.model as M
+    inputs = _fused_inputs()
+    assert M.FUSED and all(f.__name__ in inputs for f in M.FUSED)
+    for f in M.FUSED:
+        args = inputs[f.__name__]
+        M.FUSE = False
+        a = f(*args)
+        M.FUSE = True
+        b = f(*args)
+        for x, y in zip(a if isinstance(a, tuple) else (a,), b if isinstance(b, tuple) else (b,)):
+            assert mx.array_equal(x, y).item(), f.__name__

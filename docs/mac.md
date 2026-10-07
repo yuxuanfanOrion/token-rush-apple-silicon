@@ -62,6 +62,18 @@ greedy at every acceptance length, and a snapshot resume against a cold prefill
 | **ours, pipelined** (step t+1 built while t runs; the token never visits the host) | **18.5** | **86.7%** |
 | mlx-lm 0.32 | 17.8 | 83.4% |
 
+Removing int4 matmuls from the step leaves 7.7 ms of the 57 (everything else:
+GDN, attention, norms, ~25 small kernels per layer). Compiling the position-free
+elementwise groups (`model.FUSE`: the gated norm, SwiGLU, the attention gate, the
+conv arithmetic, residual add + RMSNorm) with `mx.compile` takes pipelined decode
+from 17.7 to 18.2 tok/s and the 8-row verify from 92 to 89 ms, interleaved A/B in
+`bench/mac/fuse_ab.py`. Each compiled group is bit-identical to its uncompiled form
+(`tests/mac`). The GDN gating and l2 norms are not compiled: compiled, they differ
+by 3.8e-6 in fp32, the recurrence carries it forward, and on one of the three
+correctness prompts the mean KL to mlx-lm went from 2.7e-4 to 6.3e-4 (max 3.8e-3 to
+1.7e-2) on the same token sequence. Compiling them too gave 18.8 tok/s; the
+0.6 tok/s is not worth that.
+
 The same picture as the 5090: raw decode is close to the wall in every engine,
 and the margin over the best rival is a few points. The headroom is speculation.
 
@@ -90,6 +102,13 @@ What we tried, all in `tokenrush/mlx/kernels.py`, measured in-graph:
   transposed so each lane's four codes are half a word, bf16 dequant in registers,
   split-K for narrow outputs: **1.45-1.85x at M = 8** against MLX's 2.2-3.6x, but
   1.2-1.5x at M = 1 (the dequantization is the fixed cost).
+
+Three more `matmul2d` variants were measured interleaved against `qmm_nax` and
+removed: integer-only dequantization (the bf16 pattern `0x4300 | q` is 128 + q
+exactly) with the affine part folded once per group (same speed, same error; the
+error is the bf16 output rounding in all of them), a k permutation giving each lane
+one 16-byte load per row per group (1.7x at M = 1, slower), and two 32-column tiles
+per SIMD group (slower). The dequantization was not the bottleneck.
 
 So the engine routes by row count: M <= 4 to MLX, 5..8 to `qmm_nax`, on M5 and
 later GPUs only (`applegpu_g17` and up; earlier chips keep MLX's kernels, untested). Interleaved
@@ -140,6 +159,88 @@ request for code ran at **61 tok/s** on DFlash2 (6.5 tokens per step), an
 Anthropic request in Chinese on the MTP chain at 25 tok/s greedy (2.1 per step),
 and a second turn reused the first turn's prompt.
 
+## Against vLLM and SGLang on the same Mac
+
+Same machine, same day, same int4 bytes for every engine: the checkpoint written
+as a standard mlx-lm directory by `bench/mac/export_mlx_lm.py` (renamed, not
+requantized). Same client for every server, `bench/mac/rival_bench.py`: the Phase 0
+prompts, greedy, 256 tokens, streamed, decode tok/s after the first token, best of
+two. Logs and JSON in `results/mac/rivals/`.
+
+| engine | essay | code | math | speculative decoding |
+|---|---|---|---|---|
+| **token-rush, `--draft auto`** (DFlash2 for these prompts) | **32.0** | **49.2** | **51.1** | DFlash2, K = 7 |
+| token-rush, `--draft mtp` | 34.2 | 38.4 | 38.2 | MTP chain, K = 3 |
+| token-rush, `--draft raw` | 16.8 | 16.9 | 16.9 | none |
+| vllm-metal 0.31.0 (vLLM on MLX) | 16.9 | 17.0 | 16.9 | none available for this model |
+| SGLang, MLX backend | did not run | | | |
+| mlx-lm 0.32 (in process, `bench/mac/decode.py`) | 17.8 | | | none |
+
+Raw decode is a tie: every MLX engine streams the same bytes at about the same
+fraction of the wall. Run interleaved on a warm machine (vllm-metal, ours,
+vllm-metal again; `*-ab*.json`), ours lands between the two vllm-metal runs on every
+prompt (16.3 / 14.7 / 14.2 against 16.8-15.1 / 15.8-14.4 / 15.4-13.9). The server's
+raw path syncs every step; the in-process pipelined loop gets 18.2-18.5. The margin is speculation, and on this model neither
+rival can use any:
+
+- **vllm-metal** (installed with its `install.sh`, `vllm serve <dir>
+  --limit-mm-per-prompt '{"image":0,"video":0}'`; the export needs the base repo's
+  `preprocessor_config.json`, since vLLM treats the architecture as multimodal).
+  `--speculative-config` with `mtp`: "not supported on Metal (supported: Gemma4 MTP,
+  draft_model, ngram, dflash, dspark)". With `dflash` and the DFlash2 draft: "Model
+  Runner V1 does not support: DFlash candidate-head drafts". With `ngram` (after
+  `KMP_DUPLICATE_LIB_OK=TRUE` for a libomp clash): "Speculative decode verification
+  is not supported for hybrid models on Metal yet". Any GDN hybrid is raw-only.
+- **SGLang** (the documented Apple path: `pyproject_other.toml`, `[all_mps]`,
+  `SGLANG_USE_MLX=1`, plus `SGLANG_BUILD_RUST_EXTS=none` without a Rust toolchain).
+  v0.5.21 does not start on a Mac with any model, the documented Qwen3-0.6B
+  included: `MlxModelRunnerStub` has no `kv_cache_configurator`. `model_runner.py`
+  uses it from v0.5.16 on and the stub never gains it (read in the sources of each
+  release; only v0.5.21 and v0.5.15 were run). v0.5.15 serves Qwen3-0.6B, but on this
+  model it routes the GDN layers to the torch backend whose state pool the MLX path
+  never builds (`'NoneType' object has no attribute 'conv'`, after
+  `--mamba-scheduler-strategy no_buffer --disable-overlap-schedule`, without which
+  it refuses with "extra_buffer needs CUDA/MUSA/NPU (FLA)").
+
+## Long context
+
+`bench/mac/ctx_step.py` sets the position directly (attention reads the same bytes
+whatever the cache holds) and times one decode step and one 8-row verify step,
+interleaved over positions. KV is bf16, 64 KB per token over the 16 attention layers.
+
+| position | decode step | tok/s | ceiling | 8-row verify, before | after |
+|---|---|---|---|---|---|
+| 512 | 57.7 ms | 17.3 | 21.3 | 89 ms (1.58x) | 89 ms (1.54x) |
+| 8192 | 59.0 ms | 16.9 | 20.5 | 104 ms (1.75x) | 94 ms (1.59x) |
+| 32768 | 66.2 ms | 15.1 | 18.4 | 153 ms (2.31x) | 108 ms (1.63x) |
+| 60000 | 73.9 ms | 13.5 | 16.6 | 209 ms (2.82x) | 127 ms (1.72x) |
+
+Single-row decode holds 81-82% of its context-dependent ceiling at every length.
+The verify step did not: MLX's multi-row attention kernel reads K and V once per
+query head, so the 24 / 4 GQA heads read the cache six times (35 GB/s effective at
+32k). Folding each KV head's six query heads into the row dimension, with an
+explicit per-row causal mask, reads it once: 3.2x faster attention, same output to
+1e-4, and the verify cost now grows from 1.54x to 1.72x across 60k instead of to
+2.82x (`model.FOLD_ROWS`).
+
+`bench/mac/long_context.py` puts bench/needle.py's needle in the middle of
+pre-tokenized WikiText-2 / calibration text, asks for it, then asks for a summary
+of the same text (reusing the prefix) and times 128 tokens of that answer:
+
+| context | prefill | needle (raw / DFlash2) | raw | DFlash2 (tokens/step) |
+|---|---|---|---|---|
+| 8160 | 449 tok/s | found / found | 16.6 tok/s | **34.8** (3.76) |
+| 32736 | 232 tok/s | found / found | 10.3 | **22.9** (3.94) |
+| 59968 | 245 tok/s | found / found | 10.4 | **17.3** (3.12) |
+
+This run is the heat-affected one: it prefills for minutes, and its raw numbers at
+32k and 60k sit 30% under the step timings above. The acceptance per step is what
+it measures. Prefill is compute-bound: MLX's int4 and bf16 matmuls both top out
+at 27-30 TFLOPS at prefill shapes on this GPU (dequantize-then-dense is not
+faster), and a 2048-token chunk spends 5.4 s in matmuls, 0.5 s in the sequential
+GDN kernel and 0.1 s in everything else; at long context, attention over the cache
+adds the rest.
+
 ## Heat
 
 This is a laptop. Over a long benchmark session the same configuration got
@@ -149,16 +250,15 @@ as `step_profile.py` does, never across runs.
 
 ## Not done
 
-- **mx.compile.** The CUDA graph's job (no per-op host work) is mostly done by
-  MLX's lazy graph plus pipelining (one eval per step; 1 tok/s between the eager
-  and pipelined loops). Positions are Python ints in the attention slices and
-  rope offsets, so compiling the step needs them on device first.
-- **The verify kernel at M = 4..8.** `qmm_nax` pays 20-50% at M = 1 for
-  dequantization; a version that overlaps it with the loads, or dequantizes into
-  threadgroup memory shared by more output rows, is the next lever on the
-  speculative numbers.
-- **Long context.** Only short prompts were measured. KV is bf16 and contiguous;
-  no fp8 cache, no needle test.
+- **mx.compile of the whole step.** The position-free parts are compiled (above);
+  the rest needs positions on device (attention slices and rope offsets are Python
+  ints). What it could still save is bounded by the 7.7 ms non-matmul share.
+- **The verify kernel at M = 4..8.** `qmm_nax` costs 1.2-1.5x at M = 1 and the
+  variants above did not move it; the bound is not the dequantization. Profiling
+  the kernel itself (Xcode's Metal counters) is the next step there.
+- **Long context beyond 60k.** Measured to 60k (the needle is found there); 128k and
+  256k need `--max-len` and 8-17 GB of bf16 KV, with no fp8 cache yet. Prefill at
+  long context is attention-bound in MLX's kernel and slow (4 minutes for 60k).
 - **The quality row on Mac.** KL against bf16 needs the bf16 checkpoint (55.6 GB);
   the engine-vs-mlx-lm KL above is the correctness evidence, and the quantization
   numbers carry over because the bytes are the same.

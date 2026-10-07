@@ -13,15 +13,13 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from .config import ModelConfig
-from .hub import DEFAULT_REPO, DFLASH_REPO, PACK_META, is_packed, not_packed_message, resolve_model  # noqa: F401  (re-exported)
+from .hub import COPY_FILES, DEFAULT_REPO, DFLASH_REPO, PACK_META, is_packed, not_packed_message, resolve_model  # noqa: F401  (re-exported)
 from .model import AttnWeights, GDNWeights, LayerWeights, ModelWeights
 from .quant import DEFAULT_BACKEND, GROUP, Linear, QLinear, quantize_int4
 
 HF_PREFIX = "model.language_model."
 VISION_PREFIX = "model.visual."
 MTP_PREFIX = "mtp."
-COPY_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
-              "vocab.json", "merges.txt", "chat_template.jinja")
 
 # Projections that get the 4-bit treatment. Everything else stays bf16:
 # embeddings (one row read per token), norms, conv, the tiny in_proj_a/b, and

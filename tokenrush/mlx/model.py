@@ -17,6 +17,7 @@ from . import kernels
 from .weights import AttnWeights, GDNWeights, LayerWeights, ModelWeights
 
 RING = 16         # conv ring rows; a verify step of K+1 rows needs K + 4 <= RING
+FOLD_ROWS = 16    # attention steps of 2..FOLD_ROWS rows fold the GQA heads into rows
 
 
 # ------------------------------------------------------------------ norms
@@ -38,6 +39,82 @@ def gated_rmsnorm(x, weight, gate, eps):
 def l2norm(x, eps=1e-6):
     xf = x.astype(mx.float32)
     return xf * mx.rsqrt((xf * xf).sum(-1, keepdims=True) + eps * eps)
+
+
+# ------------------------------------------------- fused elementwise groups
+# Each decode step dispatches ~25 small kernels per layer; with weights streaming at
+# the wall, that dispatch work is most of what separates raw decode from it. The
+# position-free elementwise groups below are compiled once per shape, so mx.compile
+# fuses each into a few kernels; each is checked bit-identical to its uncompiled form
+# on real inputs. FUSE = False runs the same functions uncompiled.
+
+FUSE = True
+_compiled = {}
+FUSED = []          # every compiled group, for tests/mac's bit-identity check
+
+
+def _fused(fn):
+    def call(*args):
+        if not FUSE:
+            return fn(*args)
+        f = _compiled.get(fn)
+        if f is None:
+            f = _compiled[fn] = mx.compile(fn)
+        return f(*args)
+    call.__name__ = fn.__name__
+    FUSED.append(call)
+    return call
+
+
+@_fused
+def add_norm(x, h, gain, eps):
+    """The residual add and the next RMSNorm: -> (x + h, rmsnorm(x + h))."""
+    x = x + h
+    return x, rmsnorm(x, gain, eps)
+
+
+def gdn_prep(q, k, b, a, A, dt_bias, scale):
+    """-> (q l2-normalized and scaled, k l2-normalized, g = A * softplus(a + dt_bias), beta).
+    Not compiled: the compiled form differs in fp32 (3.8e-6 on real inputs) and the
+    recurrence carries it through every later token, doubling the mean KL to mlx-lm
+    on one of the three correctness prompts (docs/mac.md). The other groups are
+    bit-identical compiled."""
+    beta = mx.sigmoid(b).astype(mx.float32)                                 # HF: sigmoid in bf16
+    af = a.astype(mx.float32) + dt_bias
+    g = A * mx.logaddexp(af, mx.zeros_like(af))
+    return l2norm(q) * scale, l2norm(k), g, beta
+
+
+@_fused
+def gated_norm(o, weight, z, eps):
+    return gated_rmsnorm(o, weight, z, eps)
+
+
+@_fused
+def swiglu(gu):
+    f = gu.shape[-1] // 2
+    gate = gu[:, :f]
+    return (gate * mx.sigmoid(gate)) * gu[:, f:]
+
+
+@_fused
+def sigmoid_gate(o, gate):
+    gf = gate.astype(mx.float32)
+    return (o.astype(mx.float32) * mx.sigmoid(gf)).astype(o.dtype)
+
+
+@_fused
+def conv_silu(window, w):
+    """Depthwise causal conv over window [T+Kc-1, C] with w [C, Kc], fp32 products and one
+    rounding to the weight dtype, then silu in the activation dtype."""
+    Kc = w.shape[1]
+    T = window.shape[0] - Kc + 1
+    wf = w.astype(mx.float32)
+    y = window[0:T].astype(mx.float32) * wf[:, 0]
+    for j in range(1, Kc):
+        y = y + window[j:j + T].astype(mx.float32) * wf[:, j]
+    yf = y.astype(w.dtype).astype(mx.float32)
+    return (yf * mx.sigmoid(yf)).astype(window.dtype)
 
 
 # ------------------------------------------------------------------ state
@@ -82,14 +159,9 @@ def conv(x, ring, w, pos: int):
     Kc = w.shape[1]
     prev = ring[mx.array([(pos - (Kc - 1) + j) % RING for j in range(Kc - 1)])]
     window = mx.concatenate([prev, x], axis=0)                              # [T+3, C]
-    wf = w.astype(mx.float32)                                               # [C, Kc]
-    y = window[0:T].astype(mx.float32) * wf[:, 0]
-    for j in range(1, Kc):                                                  # fp32 products, one rounding
-        y = y + window[j:j + T].astype(mx.float32) * wf[:, j]
-    yf = y.astype(w.dtype).astype(mx.float32)
     keep = min(T, RING)
     ring[mx.array([(pos + t) % RING for t in range(T - keep, T)])] = x[T - keep:]
-    return (yf * mx.sigmoid(yf)).astype(x.dtype), ring
+    return conv_silu(window, w), ring
 
 
 def gdn_forward(x, w: GDNWeights, cfg: ModelConfig, st: State, gi: int, commit: bool = True):
@@ -103,11 +175,7 @@ def gdn_forward(x, w: GDNWeights, cfg: ModelConfig, st: State, gi: int, commit: 
     q = qkv[:, :qd].reshape(T, cfg.gdn_k_heads, cfg.gdn_k_dim)
     k = qkv[:, qd:2 * qd].reshape(T, cfg.gdn_k_heads, cfg.gdn_k_dim)
     v = qkv[:, 2 * qd:].reshape(T, cfg.gdn_v_heads, cfg.gdn_v_dim)
-    beta = mx.sigmoid(b).astype(mx.float32)                                 # HF: sigmoid in bf16
-    af = a.astype(mx.float32) + w.dt_bias
-    g = w.A * mx.logaddexp(af, mx.zeros_like(af))                           # A * softplus, fp32
-    qn = l2norm(q) * (cfg.gdn_k_dim ** -0.5)
-    kn = l2norm(k)
+    qn, kn, g, beta = gdn_prep(q, k, b, a, w.A, w.dt_bias, cfg.gdn_k_dim ** -0.5)
     pend = None
     if st.pend is not None:
         pend = (*st.pend[gi], st.n_pend)
@@ -115,7 +183,7 @@ def gdn_forward(x, w: GDNWeights, cfg: ModelConfig, st: State, gi: int, commit: 
     st.rec[gi] = rec
     if not commit:
         st.new_pend.append((kn, v, g, beta))
-    o = gated_rmsnorm(o.reshape(-1, cfg.gdn_v_dim), w.norm_w, z.reshape(-1, cfg.gdn_v_dim), cfg.eps)
+    o = gated_norm(o.reshape(-1, cfg.gdn_v_dim), w.norm_w, z.reshape(-1, cfg.gdn_v_dim), cfg.eps)
     return w.out(o.reshape(T, cfg.gdn_val_dim))
 
 
@@ -136,23 +204,26 @@ def attn_forward(x, w: AttnWeights, cfg: ModelConfig, st: State, ai: int, gains)
     st.k[ai][:, pos:pos + T] = k
     st.v[ai][:, pos:pos + T] = v
     K, V = st.k[ai][:, :pos + T], st.v[ai][:, :pos + T]
-    o = mx.fast.scaled_dot_product_attention(q[None], K[None], V[None], scale=hd ** -0.5,
-                                             mask="causal" if T > 1 else None)[0]
+    if 1 < T <= FOLD_ROWS:
+        # A verify step: MLX's multi-row kernel reads K/V once per query head, 6x for our
+        # 24/4 GQA. Fold each KV head's 6 query heads into the row dimension instead, so
+        # K/V are read once, with an explicit causal mask per row: row (g, i) is position
+        # pos + i. 3.2x faster at 60k context (bench/mac/ctx_step.py), same output.
+        G = cfg.n_heads // cfg.n_kv_heads
+        qf = q.reshape(cfg.n_kv_heads, G * T, hd)
+        rowpos = pos + mx.tile(mx.arange(T), (G,))
+        mask = mx.arange(pos + T)[None, :] <= rowpos[:, None]
+        o = mx.fast.scaled_dot_product_attention(qf[None], K[None], V[None], scale=hd ** -0.5, mask=mask)[0]
+        o = o.reshape(cfg.n_heads, T, hd)
+    else:
+        o = mx.fast.scaled_dot_product_attention(q[None], K[None], V[None], scale=hd ** -0.5,
+                                                 mask="causal" if T > 1 else None)[0]
     o = o.transpose(1, 0, 2).reshape(T, cfg.n_heads * hd)
-    gf = gate.astype(mx.float32)
-    o = (o.astype(mx.float32) * mx.sigmoid(gf)).astype(x.dtype)
-    return w.o(o)
+    return w.o(sigmoid_gate(o, gate))
 
 
 def mlp_forward(x, w: LayerWeights):
-    gu = w.gate_up(x)
-    f = gu.shape[-1] // 2
-    gate, up = gu[:, :f], gu[:, f:]
-    return w.down(nn_silu(gate) * up)
-
-
-def nn_silu(x):
-    return x * mx.sigmoid(x)
+    return w.down(swiglu(w.gate_up(x)))
 
 
 # ----------------------------------------------------------------- engine
@@ -200,21 +271,25 @@ class Engine:
         st.new_pend = []
         x = self.w.embed[tokens]
         feats = []
+        h = None                                     # the residual contribution not yet added to x
         for li in range(cfg.n_layers):
             lw, gn = self.w.layers[li], self.gains[li]
-            n = rmsnorm(x, gn[0], cfg.eps)
+            if h is None:
+                n = rmsnorm(x, gn[0], cfg.eps)
+            else:
+                x, n = add_norm(x, h, gn[0], cfg.eps)
             if cfg.layer_types[li] == "linear_attention":
                 h = gdn_forward(n, lw.mixer, cfg, st, self._gi[li], commit)
             else:
                 h = attn_forward(n, lw.mixer, cfg, st, self._ai[li], gn[2:])
-            x = x + h
-            x = x + mlp_forward(rmsnorm(x, gn[1], cfg.eps), lw)
+            x, n = add_norm(x, h, gn[1], cfg.eps)
+            h = mlp_forward(n, lw)
             if self.feature_layers is not None and li in self.feature_layers:
-                feats.append(x)
+                feats.append(x + h)
         self.features = mx.concatenate(feats, axis=-1) if feats else None
         if not all_rows:
-            x = x[-1:]
-        return rmsnorm(x, self.final_gain, cfg.eps)
+            x, h = x[-1:], h[-1:]
+        return add_norm(x, h, self.final_gain, cfg.eps)[1]
 
     def forward(self, tokens: mx.array, all_logits: bool = False) -> mx.array:
         """tokens [T] -> logits [1 or T, vocab]; commits and advances the state by T."""

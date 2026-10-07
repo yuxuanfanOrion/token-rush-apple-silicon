@@ -192,6 +192,7 @@ def generate_dflash(engine: Engine, draft: DFlashDraft, ids: list, max_new: int,
     t0 = time.perf_counter()
     engine.reset()
     draft.reset()
+    engine.feature_layers = draft.target_layer_ids        # another mode may have cleared it
     ids_a = mx.array(ids)
     for s in range(0, len(ids), chunk):
         H = engine.forward_hidden(ids_a[s:s + chunk])

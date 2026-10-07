@@ -10,6 +10,8 @@ DEFAULT_REPO = "zyhector/Qwen3.8-27B-TokenRush-int4g128"
 DFLASH_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 _REPO_ID = re.compile(r"^[\w.-]+/[\w.-]+$")
 PACK_META = "tokenrush.json"
+COPY_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
+              "vocab.json", "merges.txt", "chat_template.jinja")
 
 
 def resolve_model(spec: str, download: bool = True) -> str:
